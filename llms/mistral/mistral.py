@@ -73,8 +73,10 @@ class Attention(nn.Module):
         keys = keys.reshape(B, L, self.n_kv_heads, -1).transpose(0, 2, 1, 3)
         values = values.reshape(B, L, self.n_kv_heads, -1).transpose(0, 2, 1, 3)
 
-        keys = mx.repeat(keys, self.repeats, axis=1)
-        values = mx.repeat(values, self.repeats, axis=1)
+        if not args.optimized_sdpa:
+            # Baseline implementation requires the keys and values to be repeated
+            keys = mx.repeat(keys, self.repeats, axis=1)
+            values = mx.repeat(values, self.repeats, axis=1)
 
         if cache is not None:
             key_cache, value_cache = cache
@@ -86,12 +88,19 @@ class Attention(nn.Module):
             queries = self.rope(queries)
             keys = self.rope(keys)
 
-        scores = (queries * self.scale) @ keys.transpose(0, 1, 3, 2)
-        if mask is not None:
-            scores += mask
-        scores = mx.softmax(scores.astype(mx.float32), axis=-1).astype(scores.dtype)
-        output = (scores @ values).transpose(0, 2, 1, 3).reshape(B, L, -1)
-        return self.wo(output), (keys, values)
+        if args.optimized_sdpa:
+            # Optimized implementation
+            # TODO(atiorh): mx.fast_inference_sdpa --> mx.fast.scaled_dot_product_attention
+            output = mx.fast_inference_sdpa(queries, keys, values, self.scale, mask)
+        else:
+            # Baseline implementation
+            scores = (queries * self.scale) @ keys.transpose(0, 1, 3, 2)
+            if mask is not None:
+                scores += mask
+            scores = mx.softmax(scores.astype(mx.float32), axis=-1).astype(scores.dtype)
+            output = (scores @ values)
+
+        return self.wo(output.transpose(0, 2, 1, 3).reshape(B, L, -1)), (keys, values)
 
 
 class FeedForward(nn.Module):
@@ -257,6 +266,19 @@ if __name__ == "__main__":
         default=10,
     )
     parser.add_argument("--seed", type=int, default=0, help="The PRNG seed")
+    parser.add_argument(
+        "--benchmark-json-path",
+        type=str,
+        help="The path to the benchmark data output file",
+        default="benchmark.json",
+    )
+    parser.add_argument(
+        "--optimized-sdpa",
+        action="store_true",
+        help="Use the optimized implementation of scaled dot product attention",
+    )
+
+    benchmark_data = []
 
     args = parser.parse_args()
 
@@ -278,9 +300,14 @@ if __name__ == "__main__":
             tic = time.time()
 
         if (len(tokens) % args.tokens_per_eval) == 0:
+            iter_tic = time.time()
             mx.eval(tokens)
+            iter_toc = time.time()
             s = tokenizer.decode([t.item() for t in tokens])
-            print(s, end="", flush=True)
+            # print(s, end="", flush=True)
+            tokens_tps = round(len(tokens) / (iter_toc - iter_tic), 2)
+            benchmark_data.append((ntoks, tokens_tps, s))
+            print(benchmark_data[-1])
             tokens = []
 
     mx.eval(tokens)
@@ -292,3 +319,6 @@ if __name__ == "__main__":
         f"Tokens per second: prompt {prompt_tps:.3f}, "
         f"generation {generation_tps:.3f}"
     )
+
+    with open(args.benchmark_json_path, "w") as f:
+        json.dump(benchmark_data, f, indent=2)
