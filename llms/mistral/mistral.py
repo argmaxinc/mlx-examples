@@ -91,7 +91,7 @@ class Attention(nn.Module):
         if args.optimized_sdpa:
             # Optimized implementation
             # TODO(atiorh): mx.fast_inference_sdpa --> mx.fast.scaled_dot_product_attention
-            output = mx.fast_inference_sdpa(queries, keys, values, self.scale, mask)
+            output = mx.fast.scaled_dot_product_attention(queries, keys, values, scale=self.scale, mask=mask)
         else:
             # Baseline implementation
             scores = (queries * self.scale) @ keys.transpose(0, 1, 3, 2)
