@@ -277,10 +277,19 @@ if __name__ == "__main__":
         action="store_true",
         help="Use the optimized implementation of scaled dot product attention",
     )
+    parser.add_argument(
+        "--metal-disallow-cache",
+        action="store_true",
+        help="Whether to sallow caching in the metal backend",
+    )
 
     benchmark_data = []
 
     args = parser.parse_args()
+
+    if args.metal_disallow_cache:
+        print("[INFO] Disallowing caching in the metal backend.")
+        mx.metal.set_cache_limit(0)
 
     mx.random.seed(args.seed)
     print("[INFO] Loading model from disk.")
@@ -306,7 +315,17 @@ if __name__ == "__main__":
             s = tokenizer.decode([t.item() for t in tokens])
             # print(s, end="", flush=True)
             tokens_tps = round(len(tokens) / (iter_toc - iter_tic), 2)
-            benchmark_data.append((ntoks, tokens_tps, s))
+            peak_memory = mx.metal.get_peak_memory()
+            cache_memory = mx.metal.get_cache_memory()
+            active_memory = mx.metal.get_active_memory()
+            benchmark_data.append({
+                "kv_cache_length": ntoks,
+                "tokens_per_sec": tokens_tps,
+                "generated_text": s,
+                "peak_memory": peak_memory,
+                "cache_memory": cache_memory,
+                "active_memory": active_memory,
+            })
             print(benchmark_data[-1])
             tokens = []
 
