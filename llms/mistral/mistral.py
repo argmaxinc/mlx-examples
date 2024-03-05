@@ -11,6 +11,7 @@ import mlx.core as mx
 import mlx.nn as nn
 from mlx.utils import tree_unflatten
 from sentencepiece import SentencePieceProcessor
+from pprint import pprint
 
 
 @dataclass
@@ -326,7 +327,7 @@ if __name__ == "__main__":
                 "cache_memory": cache_memory,
                 "active_memory": active_memory,
             })
-            print(benchmark_data[-1])
+            pprint(benchmark_data[-1])
             tokens = []
 
     mx.eval(tokens)
