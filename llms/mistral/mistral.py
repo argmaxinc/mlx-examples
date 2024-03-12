@@ -74,7 +74,8 @@ class Attention(nn.Module):
         keys = keys.reshape(B, L, self.n_kv_heads, -1).transpose(0, 2, 1, 3)
         values = values.reshape(B, L, self.n_kv_heads, -1).transpose(0, 2, 1, 3)
 
-        if not args.optimized_sdpa:
+        needs_tile = not (args.optimized_sdpa or args.broadcast_instead_of_tile)
+        if needs_tile:
             # Baseline implementation requires the keys and values to be repeated
             keys = mx.repeat(keys, self.repeats, axis=1)
             values = mx.repeat(values, self.repeats, axis=1)
@@ -83,23 +84,36 @@ class Attention(nn.Module):
             key_cache, value_cache = cache
             queries = self.rope(queries, offset=key_cache.shape[2])
             keys = self.rope(keys, offset=key_cache.shape[2])
-            keys = mx.concatenate([key_cache, keys], axis=2)
-            values = mx.concatenate([value_cache, values], axis=2)
         else:
             queries = self.rope(queries)
             keys = self.rope(keys)
 
+        if args.broadcast_instead_of_tile:
+            values = values[:, :, None]
+            keys = keys.reshape(B, L, self.n_kv_heads, 1, -1).transpose(0, 2, 3, 4, 1)
+
+        if cache is not None:
+            keys = mx.concatenate([key_cache, keys], axis=-1)
+            values = mx.concatenate([value_cache, values], axis=-2)
+
         if args.optimized_sdpa:
             # Optimized implementation
-            # TODO(atiorh): mx.fast_inference_sdpa --> mx.fast.scaled_dot_product_attention
             output = mx.fast.scaled_dot_product_attention(queries, keys, values, scale=self.scale, mask=mask)
         else:
             # Baseline implementation
-            scores = (queries * self.scale) @ keys.transpose(0, 1, 3, 2)
-            if mask is not None:
-                scores += mask
-            scores = mx.softmax(scores.astype(mx.float32), axis=-1).astype(scores.dtype)
-            output = (scores @ values)
+            if args.broadcast_instead_of_tile:
+                queries = queries.reshape(B, L, self.n_kv_heads, self.repeats, -1).transpose(0, 2, 3, 1, 4)
+                scores = (queries * self.scale) @ keys
+                if mask is not None:
+                    scores += mask
+                scores = mx.softmax(scores.astype(mx.float32), axis=-1).astype(scores.dtype)
+                output = (scores @ values).reshape(B, self.n_heads, L, -1)
+            else:
+                scores = (queries * self.scale) @ keys.transpose(0, 1, 3, 2)
+                if mask is not None:
+                    scores += mask
+                scores = mx.softmax(scores.astype(mx.float32), axis=-1).astype(scores.dtype)
+                output = (scores @ values)
 
         return self.wo(output.transpose(0, 2, 1, 3).reshape(B, L, -1)), (keys, values)
 
@@ -282,6 +296,11 @@ if __name__ == "__main__":
         "--metal-disallow-cache",
         action="store_true",
         help="Whether to sallow caching in the metal backend",
+    )
+    parser.add_argument(
+        "--broadcast-instead-of-tile",
+        action="store_true",
+        help="Whether to use broadcasting instead of tiling for GQA KV cache",
     )
 
     benchmark_data = []
