@@ -1,27 +1,36 @@
+# Copyright © 2024 Apple Inc.
+
+import inspect
 from dataclasses import dataclass
 from typing import Dict, Optional, Tuple, Union
 
 import mlx.core as mx
 import mlx.nn as nn
 
-from .base import BaseModelArgs
-from .layers import RMSNorm
-
 
 @dataclass
-class ModelArgs(BaseModelArgs):
+class TextConfig:
     model_type: str
-    hidden_size: int
-    num_hidden_layers: int
-    intermediate_size: int
-    num_attention_heads: int
-    rms_norm_eps: float
-    vocab_size: int
+    hidden_size: int = 4096
+    num_hidden_layers: int = 32
+    intermediate_size: int = 11008
+    num_attention_heads: int = 32
+    rms_norm_eps: float = 1e-6
+    vocab_size: int = 32000
     num_key_value_heads: int = None
-    rope_theta: float = 1000000
+    rope_theta: float = 10000
     rope_traditional: bool = False
     rope_scaling: Optional[Dict[str, Union[float, str]]] = None
-    tie_word_embeddings: bool = True
+
+    @classmethod
+    def from_dict(cls, params):
+        return cls(
+            **{
+                k: v
+                for k, v in params.items()
+                if k in inspect.signature(cls).parameters
+            }
+        )
 
     def __post_init__(self):
         if self.num_key_value_heads is None:
@@ -36,31 +45,48 @@ class ModelArgs(BaseModelArgs):
                 raise ValueError("rope_scaling 'type' currently only supports 'linear'")
 
 
+class RMSNorm(nn.Module):
+    def __init__(self, dims: int, eps: float = 1e-5):
+        super().__init__()
+        self.weight = mx.ones((dims,))
+        self.eps = eps
+
+    def _norm(self, x):
+        return x * mx.rsqrt(x.square().mean(-1, keepdims=True) + self.eps)
+
+    def __call__(self, x):
+        output = self._norm(x.astype(mx.float32)).astype(x.dtype)
+        return self.weight * output
+
+
 class Attention(nn.Module):
-    def __init__(self, args: ModelArgs):
+    def __init__(self, config: TextConfig):
         super().__init__()
 
-        dim = args.hidden_size
-        self.n_heads = n_heads = args.num_attention_heads
-        self.n_kv_heads = n_kv_heads = args.num_key_value_heads
+        dim = config.hidden_size
+        self.n_heads = n_heads = config.num_attention_heads
+        self.n_kv_heads = n_kv_heads = config.num_key_value_heads
 
-        head_dim = args.hidden_size // n_heads
+        self.repeats = n_heads // n_kv_heads
+
+        head_dim = config.hidden_size // n_heads
         self.scale = head_dim**-0.5
 
-        self.q_proj = nn.Linear(dim, n_heads * head_dim, bias=True)
-        self.k_proj = nn.Linear(dim, n_kv_heads * head_dim, bias=True)
-        self.v_proj = nn.Linear(dim, n_kv_heads * head_dim, bias=True)
+        self.q_proj = nn.Linear(dim, n_heads * head_dim, bias=False)
+        self.k_proj = nn.Linear(dim, n_kv_heads * head_dim, bias=False)
+        self.v_proj = nn.Linear(dim, n_kv_heads * head_dim, bias=False)
         self.o_proj = nn.Linear(n_heads * head_dim, dim, bias=False)
 
         rope_scale = (
-            1 / args.rope_scaling["factor"]
-            if args.rope_scaling is not None and args.rope_scaling["type"] == "linear"
+            1 / config.rope_scaling["factor"]
+            if config.rope_scaling is not None
+            and config.rope_scaling["type"] == "linear"
             else 1
         )
         self.rope = nn.RoPE(
             head_dim,
-            traditional=args.rope_traditional,
-            base=args.rope_theta,
+            traditional=config.rope_traditional,
+            base=config.rope_theta,
             scale=rope_scale,
         )
 
@@ -79,6 +105,10 @@ class Attention(nn.Module):
         keys = keys.reshape(B, L, self.n_kv_heads, -1).transpose(0, 2, 1, 3)
         values = values.reshape(B, L, self.n_kv_heads, -1).transpose(0, 2, 1, 3)
 
+        if self.repeats > 1:
+            keys = mx.repeat(keys, self.repeats, axis=1)
+            values = mx.repeat(values, self.repeats, axis=1)
+
         if cache is not None:
             key_cache, value_cache = cache
             queries = self.rope(queries, offset=key_cache.shape[2])
@@ -89,10 +119,11 @@ class Attention(nn.Module):
             queries = self.rope(queries)
             keys = self.rope(keys)
 
-        output = mx.fast.scaled_dot_product_attention(
-            queries, keys, values, scale=self.scale, mask=mask
-        )
-        output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
+        scores = (queries * self.scale) @ keys.transpose(0, 1, 3, 2)
+        if mask is not None:
+            scores += mask
+        scores = mx.softmax(scores.astype(mx.float32), axis=-1).astype(scores.dtype)
+        output = (scores @ values).transpose(0, 2, 1, 3).reshape(B, L, -1)
         return self.o_proj(output), (keys, values)
 
 
@@ -108,15 +139,17 @@ class MLP(nn.Module):
 
 
 class TransformerBlock(nn.Module):
-    def __init__(self, args: ModelArgs):
+    def __init__(self, config: TextConfig):
         super().__init__()
-        self.num_attention_heads = args.num_attention_heads
-        self.hidden_size = args.hidden_size
-        self.self_attn = Attention(args)
-        self.mlp = MLP(args.hidden_size, args.intermediate_size)
-        self.input_layernorm = RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
-        self.post_attention_layernorm = RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
-        self.args = args
+        self.num_attention_heads = config.num_attention_heads
+        self.hidden_size = config.hidden_size
+        self.self_attn = Attention(config)
+        self.mlp = MLP(config.hidden_size, config.intermediate_size)
+        self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.post_attention_layernorm = RMSNorm(
+            config.hidden_size, eps=config.rms_norm_eps
+        )
+        self.config = config
 
     def __call__(
         self,
@@ -131,25 +164,30 @@ class TransformerBlock(nn.Module):
         return out, cache
 
 
-class Qwen2Model(nn.Module):
-    def __init__(self, args: ModelArgs):
+class Llama(nn.Module):
+    def __init__(self, config: TextConfig):
         super().__init__()
-        self.args = args
-        self.vocab_size = args.vocab_size
-        self.num_hidden_layers = args.num_hidden_layers
+        self.config = config
+        self.vocab_size = config.vocab_size
+        self.num_hidden_layers = config.num_hidden_layers
         assert self.vocab_size > 0
-        self.embed_tokens = nn.Embedding(args.vocab_size, args.hidden_size)
+        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
         self.layers = [
-            TransformerBlock(args=args) for _ in range(args.num_hidden_layers)
+            TransformerBlock(config=config) for _ in range(config.num_hidden_layers)
         ]
-        self.norm = RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
+        self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
     def __call__(
         self,
         inputs: mx.array,
         cache=None,
+        inputs_embeds=None,
     ):
-        h = self.embed_tokens(inputs)
+        # for passing merged input embeddings
+        if inputs_embeds is None:
+            h = self.embed_tokens(inputs)
+        else:
+            h = inputs_embeds
 
         mask = None
         if h.shape[1] > 1:
@@ -165,30 +203,29 @@ class Qwen2Model(nn.Module):
         return self.norm(h), cache
 
 
-class Model(nn.Module):
-    def __init__(self, args: ModelArgs):
+class LanguageModel(nn.Module):
+    def __init__(self, config: TextConfig):
         super().__init__()
-        self.args = args
-        self.model_type = args.model_type
-        self.model = Qwen2Model(args)
-        self.lm_head = nn.Linear(args.hidden_size, args.vocab_size, bias=False)
+        self.model_type = config.model_type
+        if self.model_type != "llama":
+            raise ValueError(
+                f"Model type {self.model_type} not supported. Currently only 'llama' is supported"
+            )
+        self.model = Llama(config)
+        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
 
     def __call__(
         self,
         inputs: mx.array,
         cache=None,
+        inputs_embeds=None,
     ):
-        out, cache = self.model(inputs, cache)
+        out, cache = self.model(inputs, cache, inputs_embeds)
         return self.lm_head(out), cache
 
-    def sanitize(self, weights):
-        if self.args.tie_word_embeddings and "lm_head.weight" not in weights:
-            weights["lm_head.weight"] = weights["model.embed_tokens.weight"]
+    @staticmethod
+    def sanitize(weights):
         # Remove unused precomputed rotary freqs
         return {
             k: v for k, v in weights.items() if "self_attn.rotary_emb.inv_freq" not in k
         }
-
-    @property
-    def layers(self):
-        return self.model.layers

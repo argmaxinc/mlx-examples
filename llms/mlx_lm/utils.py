@@ -1,16 +1,20 @@
+# Copyright © 2023-2024 Apple Inc.
+
 import copy
-import gc
 import glob
 import importlib
 import json
 import logging
+import shutil
 import time
 from pathlib import Path
+from textwrap import dedent
 from typing import Any, Callable, Dict, Generator, List, Optional, Tuple, Union
 
 import mlx.core as mx
 import mlx.nn as nn
 from huggingface_hub import snapshot_download
+from mlx.utils import tree_flatten
 from transformers import AutoConfig, AutoTokenizer, PreTrainedTokenizer
 
 # Local imports
@@ -53,13 +57,14 @@ def _get_classes(config: dict):
     return arch.Model, arch.ModelArgs
 
 
-def get_model_path(path_or_hf_repo: str) -> Path:
+def get_model_path(path_or_hf_repo: str, revision: Optional[str] = None) -> Path:
     """
     Ensures the model is available locally. If the path does not exist locally,
     it is downloaded from the Hugging Face Hub.
 
     Args:
         path_or_hf_repo (str): The local path or Hugging Face repository ID of the model.
+        revision (str, optional): A revision id which can be a branch name, a tag, or a commit hash.
 
     Returns:
         Path: The path to the model.
@@ -69,6 +74,7 @@ def get_model_path(path_or_hf_repo: str) -> Path:
         model_path = Path(
             snapshot_download(
                 repo_id=path_or_hf_repo,
+                revision=revision,
                 allow_patterns=[
                     "*.json",
                     "*.safetensors",
@@ -108,9 +114,10 @@ def apply_repetition_penalty(logits: mx.array, generated_tokens: Any, penalty: f
 def generate_step(
     prompt: mx.array,
     model: nn.Module,
-    temp: 0.0,
+    temp: float = 0.0,
     repetition_penalty: Optional[float] = None,
     repetition_context_size: Optional[int] = 20,
+    top_p: float = 1.0,
 ) -> Generator[Tuple[mx.array, mx.array], None, None]:
     """
     A generator producing text based on the given prompt from the model.
@@ -121,6 +128,7 @@ def generate_step(
         temp (float): The temperature for sampling, if 0 the argmax is used.
         repetition_penalty (float, optional): The penalty factor for repeating tokens.
         repetition_context_size (int, optional): The number of tokens to consider for repetition penalty (default 20).
+        top_p (float, optional): Nulceus sampling, higher means model considers more less likely words
 
     Yields:
         Generator[Tuple[mx.array, mx.array]]: A generator producing
@@ -133,7 +141,26 @@ def generate_step(
         if temp == 0:
             token = mx.argmax(logits, axis=-1)
         else:
-            token = mx.random.categorical(logits * (1 / temp))
+            if top_p > 0 and top_p < 1.0:
+                if (
+                    logits.dtype == mx.bfloat16
+                ):  # workdaround for unable to load kernel contiguous_scan_inclusive_sum_bfloat16_bfloat16
+                    logits = logits.astype(mx.float32)
+                probs = mx.softmax(logits / temp, axis=-1)
+
+                sorted_probs = mx.sort(probs)[::-1]
+                sorted_indices = mx.argsort(probs)[::-1]
+                cumulative_probs = mx.cumsum(sorted_probs, axis=-1)
+
+                top_probs = mx.where(
+                    cumulative_probs > 1 - top_p,
+                    sorted_probs,
+                    mx.zeros_like(sorted_probs),
+                )
+                sorted_token = mx.random.categorical(mx.log(top_probs))
+                token = sorted_indices.squeeze(0)[sorted_token]
+            else:
+                token = mx.random.categorical(logits * (1 / temp))
 
         prob = softmax_logits[0, token]
         return token, prob
@@ -179,9 +206,10 @@ def generate(
     temp: float = 0.0,
     max_tokens: int = 100,
     verbose: bool = False,
-    formatter: Callable = None,
+    formatter: Optional[Callable] = None,
     repetition_penalty: Optional[float] = None,
     repetition_context_size: Optional[int] = None,
+    top_p: float = 1.0,
 ) -> str:
     """
     Generate text from the model.
@@ -218,6 +246,7 @@ def generate(
             temp,
             repetition_penalty,
             repetition_context_size,
+            top_p,
         ),
         range(max_tokens),
     ):
@@ -290,11 +319,12 @@ def load_model(model_path: Path, lazy: bool = False) -> nn.Module:
         weights.update(mx.load(wf))
 
     model_class, model_args_class = _get_classes(config=config)
-    if hasattr(model_class, "sanitize"):
-        weights = model_class.sanitize(weights)
 
     model_args = model_args_class.from_dict(config)
     model = model_class(model_args)
+
+    if hasattr(model, "sanitize"):
+        weights = model.sanitize(weights)
 
     if quantization is not None:
         # for legacy models that don't have lm_head quant due to non-32 dims
@@ -329,14 +359,14 @@ def load_model(model_path: Path, lazy: bool = False) -> nn.Module:
 def load(
     path_or_hf_repo: str,
     tokenizer_config={},
-    adapter_file: str = None,
+    adapter_file: Optional[str] = None,
     lazy: bool = False,
 ) -> Tuple[nn.Module, PreTrainedTokenizer]:
     """
     Load the model and tokenizer from a given path or a huggingface repository.
 
     Args:
-        model_path (Path): The path or the huggingface repository to load the model from.
+        path_or_hf_repo (Path): The path or the huggingface repository to load the model from.
         tokenizer_config (dict, optional): Configuration parameters specifically for the tokenizer.
             Defaults to an empty dictionary.
         adapter_file (str, optional): Path to the adapter file. If provided, applies LoRA layers to the model.
@@ -364,7 +394,7 @@ def load(
 
 def fetch_from_hub(
     model_path: Path, lazy: bool = False
-) -> Tuple[Dict, dict, PreTrainedTokenizer]:
+) -> Tuple[nn.Module, dict, PreTrainedTokenizer]:
     model = load_model(model_path, lazy)
 
     config = AutoConfig.from_pretrained(model_path)
@@ -412,23 +442,25 @@ def upload_to_hub(path: str, upload_repo: str, hf_path: str):
 
     card = ModelCard.load(hf_path)
     card.data.tags = ["mlx"] if card.data.tags is None else card.data.tags + ["mlx"]
-    card.text = f"""
-# {upload_repo}
-This model was converted to MLX format from [`{hf_path}`]().
-Refer to the [original model card](https://huggingface.co/{hf_path}) for more details on the model.
-## Use with mlx
+    card.text = dedent(
+        f"""
+        # {upload_repo}
+        This model was converted to MLX format from [`{hf_path}`]().
+        Refer to the [original model card](https://huggingface.co/{hf_path}) for more details on the model.
+        ## Use with mlx
 
-```bash
-pip install mlx-lm
-```
+        ```bash
+        pip install mlx-lm
+        ```
 
-```python
-from mlx_lm import load, generate
+        ```python
+        from mlx_lm import load, generate
 
-model, tokenizer = load("{upload_repo}")
-response = generate(model, tokenizer, prompt="hello", verbose=True)
-```
-"""
+        model, tokenizer = load("{upload_repo}")
+        response = generate(model, tokenizer, prompt="hello", verbose=True)
+        ```
+        """
+    )
     card.save(os.path.join(path, "README.md"))
 
     logging.set_verbosity_info()
@@ -440,6 +472,7 @@ response = generate(model, tokenizer, prompt="hello", verbose=True)
         repo_id=upload_repo,
         repo_type="model",
     )
+    print(f"Upload successful, go to https://huggingface.co/{upload_repo} for details.")
 
 
 def save_weights(
@@ -468,7 +501,7 @@ def save_weights(
     # necessary ones
     if donate_weights:
         weights.clear()
-        gc.collect()
+        del weights
 
     for i in range(len(shards)):
         shard = shards[i]
@@ -476,12 +509,11 @@ def save_weights(
         shard_name = shard_file_format.format(i + 1, shards_count)
         shard_path = save_path / shard_name
 
-        mx.save_safetensors(str(shard_path), shard)
+        mx.save_safetensors(str(shard_path), shard, metadata={"format": "mlx"})
 
         for weight_name in shard.keys():
             index_data["weight_map"][weight_name] = shard_name
         del shard
-        gc.collect()
 
     index_data["weight_map"] = {
         k: index_data["weight_map"][k] for k in sorted(index_data["weight_map"])
@@ -493,3 +525,71 @@ def save_weights(
             f,
             indent=4,
         )
+
+
+def quantize_model(
+    model: nn.Module, config: dict, q_group_size: int, q_bits: int
+) -> Tuple:
+    """
+    Applies quantization to the model weights.
+
+    Args:
+        model (nn.Module): The model to be quantized.
+        config (dict): Model configuration.
+        q_group_size (int): Group size for quantization.
+        q_bits (int): Bits per weight for quantization.
+
+    Returns:
+        Tuple: Tuple containing quantized weights and config.
+    """
+    quantized_config = copy.deepcopy(config)
+
+    nn.QuantizedLinear.quantize_module(
+        model, q_group_size, q_bits, linear_class_predicate=linear_class_predicate
+    )
+    quantized_config["quantization"] = {"group_size": q_group_size, "bits": q_bits}
+    quantized_weights = dict(tree_flatten(model.parameters()))
+
+    return quantized_weights, quantized_config
+
+
+def convert(
+    hf_path: str,
+    mlx_path: str = "mlx_model",
+    quantize: bool = False,
+    q_group_size: int = 64,
+    q_bits: int = 4,
+    dtype: str = "float16",
+    upload_repo: str = None,
+    revision: Optional[str] = None,
+):
+    print("[INFO] Loading")
+    model_path = get_model_path(hf_path, revision=revision)
+    model, config, tokenizer = fetch_from_hub(model_path, lazy=True)
+
+    weights = dict(tree_flatten(model.parameters()))
+    dtype = mx.float16 if quantize else getattr(mx, dtype)
+    weights = {k: v.astype(dtype) for k, v in weights.items()}
+
+    if quantize:
+        print("[INFO] Quantizing")
+        model.load_weights(list(weights.items()))
+        weights, config = quantize_model(model, config, q_group_size, q_bits)
+
+    if isinstance(mlx_path, str):
+        mlx_path = Path(mlx_path)
+
+    del model
+    save_weights(mlx_path, weights, donate_weights=True)
+
+    py_files = glob.glob(str(model_path / "*.py"))
+    for file in py_files:
+        shutil.copy(file, mlx_path)
+
+    tokenizer.save_pretrained(mlx_path)
+
+    with open(mlx_path / "config.json", "w") as fid:
+        json.dump(config, fid, indent=4)
+
+    if upload_repo is not None:
+        upload_to_hub(mlx_path, upload_repo, hf_path)
